@@ -5,7 +5,6 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas_ta as ta
 import requests
-import time
 from datetime import datetime
 
 st.set_page_config(page_title="Crypto Trade Predictor - Winrate Historique", layout="wide", page_icon="📈")
@@ -32,7 +31,7 @@ if st.sidebar.button("🚀 Analyser ce trade", type="primary", use_container_wid
     st.session_state["sl"] = sl_pct
     st.session_state["max_candles"] = max_candles_exit
 
-# ====================== COINGECKO (stable) ======================
+# ====================== COINGECKO FETCH (ultra-robuste) ======================
 @st.cache_data(ttl=60)
 def fetch_ohlcv_coingecko(pair, timeframe, limit=200):
     mapping = {
@@ -40,38 +39,43 @@ def fetch_ohlcv_coingecko(pair, timeframe, limit=200):
         "XRP/USDT": "ripple", "BNB/USDT": "binancecoin", "ADA/USDT": "cardano"
     }
     coin_id = mapping.get(pair, pair.lower().split("/")[0])
-    
+
     try:
         url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/ohlc"
         params = {"vs_currency": "usd", "days": 90, "interval": "hourly"}
         resp = requests.get(url, params=params, timeout=15)
         data = resp.json()
-        
+
         df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df = df.tail(limit).reset_index(drop=True)
         df["volume"] = np.nan
+        if len(df) == 0:
+            raise ValueError("Empty response")
         return df
     except:
-        st.warning("⚠️ CoinGecko lent → Mode simulé activé")
+        st.warning("⚠️ CoinGecko lent ou indisponible → Mode simulé activé")
+        # Mock FORCÉ avec exactement 'limit' bougies
         base = 3400 if "ETH" in pair else 62000 if "BTC" in pair else 140
-        prices = base + np.cumsum(np.random.normal(0, base*0.008, limit))
+        prices = base + np.cumsum(np.random.normal(0, base * 0.008, limit))
         df = pd.DataFrame({
-            "timestamp": pd.date_range(end=datetime.now(), periods=limit, freq="4h" if timeframe=="4h" else "1h"),
-            "open": prices * 0.998, "high": prices * 1.008,
-            "low": prices * 0.992, "close": prices,
+            "timestamp": pd.date_range(end=datetime.now(), periods=limit, freq="4h" if timeframe == "4h" else "1h"),
+            "open": prices * 0.998,
+            "high": prices * 1.008,
+            "low": prices * 0.992,
+            "close": prices,
             "volume": np.random.uniform(10000, 80000, limit)
         })
         return df
 
-# ====================== INDICATEURS ULTRA-ROBUSTES ======================
+# ====================== INDICATEURS + SCORING ======================
 def add_indicators(df):
     # RSI
     try:
         df["RSI"] = ta.rsi(df["close"], length=14)
     except:
         df["RSI"] = np.random.uniform(30, 70, len(df))
-    
+
     # MACD
     try:
         macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
@@ -82,8 +86,8 @@ def add_indicators(df):
         df["MACD"] = np.random.normal(0, 50, len(df))
         df["MACD_signal"] = df["MACD"].rolling(9).mean()
         df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
-    
-    # Bollinger Bands
+
+    # Bollinger
     try:
         bb = ta.bbands(df["close"], length=20, std=2)
         df["BB_upper"] = bb["BBU_20_2.0"]
@@ -91,10 +95,10 @@ def add_indicators(df):
     except:
         df["BB_upper"] = df["close"] * 1.028
         df["BB_lower"] = df["close"] * 0.972
-    
+
     df["BBP"] = (df["close"] - df["BB_lower"]) / (df["BB_upper"] - df["BB_lower"])
-    
-    # ADX
+
+    # ADX + CHOP
     try:
         adx = ta.adx(df["high"], df["low"], df["close"], length=14)
         df["ADX"] = adx["ADX_14"]
@@ -104,23 +108,18 @@ def add_indicators(df):
         df["ADX"] = np.random.uniform(20, 35, len(df))
         df["DMP"] = np.random.uniform(15, 30, len(df))
         df["DMN"] = np.random.uniform(10, 25, len(df))
-    
-    # CHOP
+
     try:
         atr = ta.atr(df["high"], df["low"], df["close"], length=14)
         high_low = df["high"].rolling(14).max() - df["low"].rolling(14).min()
         df["CHOP"] = 100 * np.log10(atr.rolling(14).sum() / high_low) / np.log10(14)
     except:
         df["CHOP"] = np.random.uniform(25, 55, len(df))
-    
-    # MACD crossover
+
     df["macd_cross_up"] = (df["MACD"] > df["MACD_signal"]) & (df["MACD"].shift(1) <= df["MACD_signal"].shift(1))
-    
-    # Nettoyage
     df = df.fillna(method="ffill").fillna(method="bfill")
     return df
 
-# ====================== SCORING EXACT ======================
 def calculate_score(row):
     score_long = score_short = 0
     if row['ADX'] > 25:
@@ -135,7 +134,7 @@ def calculate_score(row):
     if row['RSI'] > 65: score_short += 15
     if row['BBP'] < 0.2: score_long += 15
     if row['BBP'] > 0.8: score_short += 15
-    
+
     total = max(score_long, score_short)
     direction = "LONG" if score_long > score_short else ("SHORT" if score_short > score_long else "NEUTRAL")
     confidence = round(total / 85 * 100)
@@ -154,7 +153,19 @@ mtf_data = {}
 
 for tf_name, limit in timeframes.items():
     df = fetch_ohlcv_coingecko(pair, tf_name, limit)
+    
+    # PROTECTION contre DataFrame vide
+    if len(df) == 0:
+        st.error("❌ Aucune donnée reçue. Réessayez dans 30 secondes.")
+        st.stop()
+    
     df = add_indicators(df)
+    
+    # Double protection
+    if len(df) == 0:
+        st.error("❌ DataFrame vide après calcul des indicateurs.")
+        st.stop()
+    
     latest = df.iloc[-1]
     direction, confidence = calculate_score(latest)
     
@@ -193,4 +204,4 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 st.success("✅ Analyse terminée (version ultra-robuste)")
-st.caption("CoinGecko + tous les indicateurs protégés")
+st.caption("Toutes les protections contre DataFrame vide sont activées")
